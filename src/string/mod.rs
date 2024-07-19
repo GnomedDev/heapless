@@ -213,6 +213,8 @@ impl<const N: usize> String<N> {
     #[inline]
     pub fn from_utf8<LenT: LenType>(vec: Vec<u8, N, LenT>) -> Result<Self, Utf8Error> {
         core::str::from_utf8(&vec)?;
+
+        // SAFETY: UTF-8 invariant has just been checked by `str::from_utf8`.
         Ok(unsafe { Self::from_utf8_unchecked(vec) })
     }
 
