@@ -190,6 +190,8 @@ impl<T, LenT: LenType, const N: usize> Vec<T, N, LenT> {
         const { check_capacity_fits::<NewLenT, N>() }
         let this = ManuallyDrop::new(self);
 
+        // SAFETY: Pointer argument is derived from a reference, meeting the safety documented invariants.
+        // This also prevents double drops by wrapping `self` in `ManuallyDrop`.
         Vec {
             len: NewLenT::from_usize(this.len()),
             buffer: unsafe { ptr::read(&this.buffer) },
