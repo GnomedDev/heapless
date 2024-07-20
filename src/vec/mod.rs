@@ -393,6 +393,10 @@ impl<T, LenT: LenType> VecView<T, LenT> {
 }
 
 impl<T, LenT: LenType, S: Storage> VecInner<T, LenT, S> {
+    pub(crate) fn len_as_type(&self) -> LenT {
+        self.len
+    }
+
     /// Returns a raw pointer to the vector’s buffer.
     pub fn as_ptr(&self) -> *const T {
         self.buffer.borrow().as_ptr() as *const T

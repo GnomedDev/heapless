@@ -12,7 +12,7 @@ where
     }
 }
 
-impl<S: Storage> defmt::Format for StringInner<S>
+impl<LenT: LenType, S: Storage> defmt::Format for StringInner<LenT, S>
 where
     u8: defmt::Format,
 {
