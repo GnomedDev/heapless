@@ -104,20 +104,23 @@ use core::sync::atomic;
 #[cfg(feature = "portable-atomic")]
 use portable_atomic as atomic;
 
-use atomic::{AtomicUsize, Ordering};
+use atomic::Ordering;
 
-use crate::storage::{OwnedStorage, Storage, ViewStorage};
+use crate::{
+    len_type::{AtomicDefaultLenType, AtomicLenType, LenType},
+    storage::{OwnedStorage, Storage, ViewStorage},
+};
 
 /// Base struct for [`Queue`] and [`QueueView`], generic over the [`Storage`].
 ///
 /// In most cases you should use [`Queue`] or [`QueueView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct QueueInner<T, S: Storage> {
+pub struct QueueInner<T, LenT: AtomicLenType, S: Storage> {
     // this is from where we dequeue items
-    pub(crate) head: AtomicUsize,
+    pub(crate) head: LenT,
 
     // this is where we enqueue new items
-    pub(crate) tail: AtomicUsize,
+    pub(crate) tail: LenT,
 
     pub(crate) buffer: S::Buffer<UnsafeCell<MaybeUninit<T>>>,
 }
@@ -126,15 +129,16 @@ pub struct QueueInner<T, S: Storage> {
 ///
 /// *IMPORTANT*: To get better performance use a value for `N` that is a power of 2 (e.g. `16`, `32`,
 /// etc.).
-pub type Queue<T, const N: usize> = QueueInner<T, OwnedStorage<N>>;
+pub type Queue<T, const N: usize, LenT = AtomicDefaultLenType<N>> =
+    QueueInner<T, LenT, OwnedStorage<N>>;
 
 /// Asingle producer single consumer queue
 ///
 /// *IMPORTANT*: To get better performance use a value for `N` that is a power of 2 (e.g. `16`, `32`,
 /// etc.).
-pub type QueueView<T> = QueueInner<T, ViewStorage>;
+pub type QueueView<T, LenT = atomic::AtomicUsize> = QueueInner<T, LenT, ViewStorage>;
 
-impl<T, const N: usize> Queue<T, N> {
+impl<T, LenT: AtomicLenType, const N: usize> Queue<T, N, LenT> {
     const INIT: UnsafeCell<MaybeUninit<T>> = UnsafeCell::new(MaybeUninit::uninit());
     /// Creates an empty queue with a fixed capacity of `N - 1`
     pub const fn new() -> Self {
@@ -142,8 +146,8 @@ impl<T, const N: usize> Queue<T, N> {
         crate::sealed::greater_than_1::<N>();
 
         Queue {
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: LenT::ZERO,
+            tail: LenT::ZERO,
             buffer: [Self::INIT; N],
         }
     }
@@ -157,25 +161,29 @@ impl<T, const N: usize> Queue<T, N> {
     }
 
     /// Get a reference to the `Queue`, erasing the `N` const-generic.
-    pub fn as_view(&self) -> &QueueView<T> {
+    pub fn as_view(&self) -> &QueueView<T, LenT> {
         self
     }
 
     /// Get a mutable reference to the `Queue`, erasing the `N` const-generic.
-    pub fn as_mut_view(&mut self) -> &mut QueueView<T> {
+    pub fn as_mut_view(&mut self) -> &mut QueueView<T, LenT> {
         self
     }
 }
 
-impl<T, S: Storage> QueueInner<T, S> {
+impl<T, LenT: AtomicLenType, S: Storage> QueueInner<T, LenT, S> {
     #[inline]
-    fn increment(&self, val: usize) -> usize {
-        (val + 1) % self.n()
+    fn increment(&self, val: LenT::Normal) -> LenT::Normal {
+        (val + LenT::Normal::ONE) % self.n_as_lentype()
     }
 
     #[inline]
     fn n(&self) -> usize {
         self.buffer.borrow().len()
+    }
+
+    fn n_as_lentype(&self) -> LenT::Normal {
+        LenT::Normal::from_usize(self.n())
     }
 
     /// Returns the maximum number of elements the queue can hold
@@ -184,16 +192,20 @@ impl<T, S: Storage> QueueInner<T, S> {
         self.n() - 1
     }
 
-    /// Returns the number of elements in the queue
-    #[inline]
-    pub fn len(&self) -> usize {
+    fn len_as_lentype(&self) -> LenT::Normal {
         let current_head = self.head.load(Ordering::Relaxed);
         let current_tail = self.tail.load(Ordering::Relaxed);
 
         current_tail
             .wrapping_sub(current_head)
-            .wrapping_add(self.n())
-            % self.n()
+            .wrapping_add(self.n_as_lentype())
+            % self.n_as_lentype()
+    }
+
+    /// Returns the number of elements in the queue
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len_as_lentype().into_usize()
     }
 
     /// Returns `true` if the queue is empty
@@ -209,21 +221,20 @@ impl<T, S: Storage> QueueInner<T, S> {
     }
 
     /// Iterates from the front of the queue to the back
-    pub fn iter(&self) -> IterInner<'_, T, S> {
+    pub fn iter(&self) -> IterInner<'_, T, LenT, S> {
         IterInner {
             rb: self,
-            index: 0,
-            len: self.len(),
+            index: LenT::Normal::ZERO,
+            len: self.len_as_lentype(),
         }
     }
 
     /// Returns an iterator that allows modifying each value
-    pub fn iter_mut(&mut self) -> IterMutInner<'_, T, S> {
-        let len = self.len();
+    pub fn iter_mut(&mut self) -> IterMutInner<'_, T, LenT, S> {
         IterMutInner {
             rb: self,
-            index: 0,
-            len,
+            index: LenT::Normal::ZERO,
+            len: self.len_as_lentype(),
         }
     }
 
@@ -258,7 +269,7 @@ impl<T, S: Storage> QueueInner<T, S> {
     /// ```
     pub fn peek(&self) -> Option<&T> {
         if !self.is_empty() {
-            let head = self.head.load(Ordering::Relaxed);
+            let head = self.head.load(Ordering::Relaxed).into_usize();
             Some(unsafe { &*(self.buffer.borrow().get_unchecked(head).get() as *const T) })
         } else {
             None
@@ -273,6 +284,7 @@ impl<T, S: Storage> QueueInner<T, S> {
         let next_tail = self.increment(current_tail);
 
         if next_tail != self.head.load(Ordering::Acquire) {
+            let current_tail = current_tail.into_usize();
             (self.buffer.borrow().get_unchecked(current_tail).get()).write(MaybeUninit::new(val));
             self.tail.store(next_tail, Ordering::Release);
 
@@ -288,7 +300,12 @@ impl<T, S: Storage> QueueInner<T, S> {
     unsafe fn inner_enqueue_unchecked(&self, val: T) {
         let current_tail = self.tail.load(Ordering::Relaxed);
 
-        (self.buffer.borrow().get_unchecked(current_tail).get()).write(MaybeUninit::new(val));
+        (self
+            .buffer
+            .borrow()
+            .get_unchecked(current_tail.into_usize())
+            .get())
+        .write(MaybeUninit::new(val));
         self.tail
             .store(self.increment(current_tail), Ordering::Release);
     }
@@ -314,7 +331,12 @@ impl<T, S: Storage> QueueInner<T, S> {
         if current_head == self.tail.load(Ordering::Acquire) {
             None
         } else {
-            let v = (self.buffer.borrow().get_unchecked(current_head).get() as *const T).read();
+            let v = (self
+                .buffer
+                .borrow()
+                .get_unchecked(current_head.into_usize())
+                .get() as *const T)
+                .read();
 
             self.head
                 .store(self.increment(current_head), Ordering::Release);
@@ -328,7 +350,12 @@ impl<T, S: Storage> QueueInner<T, S> {
     // items without doing pointer arithmetic and accessing internal fields of this type.
     unsafe fn inner_dequeue_unchecked(&self) -> T {
         let current_head = self.head.load(Ordering::Relaxed);
-        let v = (self.buffer.borrow().get_unchecked(current_head).get() as *const T).read();
+        let v = (self
+            .buffer
+            .borrow()
+            .get_unchecked(current_head.into_usize())
+            .get() as *const T)
+            .read();
 
         self.head
             .store(self.increment(current_head), Ordering::Release);
@@ -347,23 +374,23 @@ impl<T, S: Storage> QueueInner<T, S> {
     }
 
     /// Splits a queue into producer and consumer endpoints
-    pub fn split(&mut self) -> (ProducerInner<'_, T, S>, ConsumerInner<'_, T, S>) {
+    pub fn split(&mut self) -> (ProducerInner<'_, T, LenT, S>, ConsumerInner<'_, T, LenT, S>) {
         (ProducerInner { rb: self }, ConsumerInner { rb: self })
     }
 }
 
-impl<T, const N: usize> Default for Queue<T, N> {
+impl<T, LenT: AtomicLenType, const N: usize> Default for Queue<T, N, LenT> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, const N: usize> Clone for Queue<T, N>
+impl<T, LenT: AtomicLenType, const N: usize> Clone for Queue<T, N, LenT>
 where
     T: Clone,
 {
     fn clone(&self) -> Self {
-        let mut new: Queue<T, N> = Queue::new();
+        let mut new = Queue::new();
 
         for s in self.iter() {
             unsafe {
@@ -377,36 +404,38 @@ where
     }
 }
 
-impl<T, S, S2> PartialEq<QueueInner<T, S2>> for QueueInner<T, S>
+impl<T, LenT1, LenT2, S, S2> PartialEq<QueueInner<T, LenT2, S2>> for QueueInner<T, LenT1, S>
 where
     T: PartialEq,
+    LenT1: AtomicLenType,
+    LenT2: AtomicLenType,
     S: Storage,
     S2: Storage,
 {
-    fn eq(&self, other: &QueueInner<T, S2>) -> bool {
+    fn eq(&self, other: &QueueInner<T, LenT2, S2>) -> bool {
         self.len() == other.len() && self.iter().zip(other.iter()).all(|(v1, v2)| v1 == v2)
     }
 }
 
-impl<T, S: Storage> Eq for QueueInner<T, S> where T: Eq {}
+impl<T, LenT: AtomicLenType, S: Storage> Eq for QueueInner<T, LenT, S> where T: Eq {}
 
 /// Base struct for [`Iter`] and [`IterView`], generic over the [`Storage`].
 ///
 /// In most cases you should use [`Iter`] or [`IterView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct IterInner<'a, T, S: Storage> {
-    rb: &'a QueueInner<T, S>,
-    index: usize,
-    len: usize,
+pub struct IterInner<'a, T, LenT: AtomicLenType, S: Storage> {
+    rb: &'a QueueInner<T, LenT, S>,
+    index: LenT::Normal,
+    len: LenT::Normal,
 }
 
 /// An iterator over the items of a queue
-pub type Iter<'a, T, const N: usize> = IterInner<'a, T, OwnedStorage<N>>;
+pub type Iter<'a, T, LenT, const N: usize> = IterInner<'a, T, LenT, OwnedStorage<N>>;
 
 /// An iterator over the items of a queue
-pub type IterView<'a, T> = IterInner<'a, T, ViewStorage>;
+pub type IterView<'a, T, LenT> = IterInner<'a, T, LenT, ViewStorage>;
 
-impl<'a, T, const N: usize> Clone for Iter<'a, T, N> {
+impl<'a, T, LenT: AtomicLenType, const N: usize> Clone for Iter<'a, T, LenT, N> {
     fn clone(&self) -> Self {
         Self {
             rb: self.rb,
@@ -420,27 +449,27 @@ impl<'a, T, const N: usize> Clone for Iter<'a, T, N> {
 ///
 /// In most cases you should use [`IterMut`] or [`IterMutView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct IterMutInner<'a, T, S: Storage> {
-    rb: &'a QueueInner<T, S>,
-    index: usize,
-    len: usize,
+pub struct IterMutInner<'a, T, LenT: AtomicLenType, S: Storage> {
+    rb: &'a QueueInner<T, LenT, S>,
+    index: LenT::Normal,
+    len: LenT::Normal,
 }
 
 /// An iterator over the items of a queue
-pub type IterMut<'a, T, const N: usize> = IterMutInner<'a, T, OwnedStorage<N>>;
+pub type IterMut<'a, T, LenT, const N: usize> = IterMutInner<'a, T, LenT, OwnedStorage<N>>;
 
 /// An iterator over the items of a queue
-pub type IterMutView<'a, T> = IterMutInner<'a, T, ViewStorage>;
+pub type IterMutView<'a, LenT, T> = IterMutInner<'a, T, LenT, ViewStorage>;
 
-impl<'a, T, S: Storage> Iterator for IterInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> Iterator for IterInner<'a, T, LenT, S> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
             let head = self.rb.head.load(Ordering::Relaxed);
 
-            let i = (head + self.index) % self.rb.n();
-            self.index += 1;
+            let i = ((head + self.index) % self.rb.n_as_lentype()).into_usize();
+            self.index += LenT::Normal::ONE;
 
             Some(unsafe { &*(self.rb.buffer.borrow().get_unchecked(i).get() as *const T) })
         } else {
@@ -449,15 +478,15 @@ impl<'a, T, S: Storage> Iterator for IterInner<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Storage> Iterator for IterMutInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> Iterator for IterMutInner<'a, T, LenT, S> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
             let head = self.rb.head.load(Ordering::Relaxed);
 
-            let i = (head + self.index) % self.rb.n();
-            self.index += 1;
+            let i = ((head + self.index) % self.rb.n_as_lentype()).into_usize();
+            self.index += LenT::Normal::ONE;
 
             Some(unsafe { &mut *(self.rb.buffer.borrow().get_unchecked(i).get() as *mut T) })
         } else {
@@ -466,14 +495,14 @@ impl<'a, T, S: Storage> Iterator for IterMutInner<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Storage> DoubleEndedIterator for IterInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> DoubleEndedIterator for IterInner<'a, T, LenT, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
             let head = self.rb.head.load(Ordering::Relaxed);
 
             // self.len > 0, since it's larger than self.index > 0
-            let i = (head + self.len - 1) % self.rb.n();
-            self.len -= 1;
+            let i = ((head + self.len - LenT::Normal::ONE) % self.rb.n_as_lentype()).into_usize();
+            self.len -= LenT::Normal::ONE;
             Some(unsafe { &*(self.rb.buffer.borrow().get_unchecked(i).get() as *const T) })
         } else {
             None
@@ -481,14 +510,14 @@ impl<'a, T, S: Storage> DoubleEndedIterator for IterInner<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Storage> DoubleEndedIterator for IterMutInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> DoubleEndedIterator for IterMutInner<'a, T, LenT, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.index < self.len {
             let head = self.rb.head.load(Ordering::Relaxed);
 
             // self.len > 0, since it's larger than self.index > 0
-            let i = (head + self.len - 1) % self.rb.n();
-            self.len -= 1;
+            let i = ((head + self.len - LenT::Normal::ONE) % self.rb.n_as_lentype()).into_usize();
+            self.len -= LenT::Normal::ONE;
             Some(unsafe { &mut *(self.rb.buffer.borrow().get_unchecked(i).get() as *mut T) })
         } else {
             None
@@ -496,7 +525,7 @@ impl<'a, T, S: Storage> DoubleEndedIterator for IterMutInner<'a, T, S> {
     }
 }
 
-impl<T, S: Storage> Drop for QueueInner<T, S> {
+impl<T, LenT: AtomicLenType, S: Storage> Drop for QueueInner<T, LenT, S> {
     fn drop(&mut self) {
         for item in self {
             unsafe {
@@ -506,7 +535,7 @@ impl<T, S: Storage> Drop for QueueInner<T, S> {
     }
 }
 
-impl<T, S> fmt::Debug for QueueInner<T, S>
+impl<T, LenT: AtomicLenType, S> fmt::Debug for QueueInner<T, LenT, S>
 where
     T: fmt::Debug,
     S: Storage,
@@ -516,7 +545,7 @@ where
     }
 }
 
-impl<T, S> hash::Hash for QueueInner<T, S>
+impl<T, LenT: AtomicLenType, S> hash::Hash for QueueInner<T, LenT, S>
 where
     T: hash::Hash,
     S: Storage,
@@ -529,18 +558,18 @@ where
     }
 }
 
-impl<'a, T, S: Storage> IntoIterator for &'a QueueInner<T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> IntoIterator for &'a QueueInner<T, LenT, S> {
     type Item = &'a T;
-    type IntoIter = IterInner<'a, T, S>;
+    type IntoIter = IterInner<'a, T, LenT, S>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-impl<'a, T, S: Storage> IntoIterator for &'a mut QueueInner<T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> IntoIterator for &'a mut QueueInner<T, LenT, S> {
     type Item = &'a mut T;
-    type IntoIter = IterMutInner<'a, T, S>;
+    type IntoIter = IterMutInner<'a, T, LenT, S>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
@@ -551,39 +580,41 @@ impl<'a, T, S: Storage> IntoIterator for &'a mut QueueInner<T, S> {
 ///
 /// In most cases you should use [`Consumer`] or [`ConsumerView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct ConsumerInner<'a, T, S: Storage> {
-    rb: &'a QueueInner<T, S>,
+pub struct ConsumerInner<'a, T, LenT: AtomicLenType, S: Storage> {
+    rb: &'a QueueInner<T, LenT, S>,
 }
 
 /// A queue "consumer"; it can dequeue items from the queue
 /// NOTE the consumer semantically owns the `head` pointer of the queue
-pub type Consumer<'a, T, const N: usize> = ConsumerInner<'a, T, OwnedStorage<N>>;
+pub type Consumer<'a, T, const N: usize, LenT = AtomicDefaultLenType<N>> =
+    ConsumerInner<'a, T, LenT, OwnedStorage<N>>;
 
 /// A queue "consumer"; it can dequeue items from the queue
 /// NOTE the consumer semantically owns the `head` pointer of the queue
-pub type ConsumerView<'a, T> = ConsumerInner<'a, T, ViewStorage>;
+pub type ConsumerView<'a, T, LenT = atomic::AtomicUsize> = ConsumerInner<'a, T, LenT, ViewStorage>;
 
-unsafe impl<'a, T, S: Storage> Send for ConsumerInner<'a, T, S> where T: Send {}
+unsafe impl<'a, T: Send, LenT: AtomicLenType, S: Storage> Send for ConsumerInner<'a, T, LenT, S> {}
 
 /// Base struct for [`Producer`] and [`ProducerView`], generic over the [`Storage`].
 ///
 /// In most cases you should use [`Producer`] or [`ProducerView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct ProducerInner<'a, T, S: Storage> {
-    rb: &'a QueueInner<T, S>,
+pub struct ProducerInner<'a, T, LenT: AtomicLenType, S: Storage> {
+    rb: &'a QueueInner<T, LenT, S>,
 }
 
 /// A queue "producer"; it can enqueue items into the queue
 /// NOTE the producer semantically owns the `tail` pointer of the queue
-pub type Producer<'a, T, const N: usize> = ProducerInner<'a, T, OwnedStorage<N>>;
+pub type Producer<'a, T, const N: usize, LenT = AtomicDefaultLenType<N>> =
+    ProducerInner<'a, T, LenT, OwnedStorage<N>>;
 
 /// A queue "producer"; it can enqueue items into the queue
 /// NOTE the producer semantically owns the `tail` pointer of the queue
-pub type ProducerView<'a, T> = ProducerInner<'a, T, ViewStorage>;
+pub type ProducerView<'a, T, LenT = atomic::AtomicUsize> = ProducerInner<'a, T, LenT, ViewStorage>;
 
-unsafe impl<'a, T, S: Storage> Send for ProducerInner<'a, T, S> where T: Send {}
+unsafe impl<'a, T: Send, LenT: AtomicLenType, S: Storage> Send for ProducerInner<'a, T, LenT, S> {}
 
-impl<'a, T, S: Storage> ConsumerInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> ConsumerInner<'a, T, LenT, S> {
     /// Returns the item in the front of the queue, or `None` if the queue is empty
     #[inline]
     pub fn dequeue(&mut self) -> Option<T> {
@@ -658,7 +689,7 @@ impl<'a, T, S: Storage> ConsumerInner<'a, T, S> {
     }
 }
 
-impl<'a, T, S: Storage> ProducerInner<'a, T, S> {
+impl<'a, T, LenT: AtomicLenType, S: Storage> ProducerInner<'a, T, LenT, S> {
     /// Adds an `item` to the end of the queue, returns back the `item` if the queue is full
     #[inline]
     pub fn enqueue(&mut self, val: T) -> Result<(), T> {
