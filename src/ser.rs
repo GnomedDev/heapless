@@ -65,7 +65,7 @@ where
     }
 }
 
-impl<T, S: Storage> Serialize for DequeInner<T, S>
+impl<T, LenT: LenType, S: Storage> Serialize for DequeInner<T, LenT, S>
 where
     T: Serialize,
 {
