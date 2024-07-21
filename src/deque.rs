@@ -39,17 +39,19 @@ use core::iter::FusedIterator;
 use core::mem::MaybeUninit;
 use core::{ptr, slice};
 
+use crate::len_type::DefaultLenType;
 use crate::storage::{OwnedStorage, Storage, ViewStorage};
+use crate::LenType;
 
 /// Base struct for [`Deque`] and [`DequeView`], generic over the [`Storage`].
 ///
 /// In most cases you should use [`Deque`] or [`DequeView`] directly. Only use this
 /// struct if you want to write code that's generic over both.
-pub struct DequeInner<T, S: Storage> {
+pub struct DequeInner<T, LenT: LenType, S: Storage> {
     /// Front index. Always 0..=(N-1)
-    front: usize,
+    front: LenT,
     /// Back index. Always 0..=(N-1).
-    back: usize,
+    back: LenT,
 
     /// Used to distinguish "empty" and "full" cases when `front == back`.
     /// May only be `true` if `front == back`, always `false` otherwise.
@@ -91,7 +93,7 @@ pub struct DequeInner<T, S: Storage> {
 ///     println!("{}", x);
 /// }
 /// ```
-pub type Deque<T, const N: usize> = DequeInner<T, OwnedStorage<N>>;
+pub type Deque<T, const N: usize, LenT = DefaultLenType<N>> = DequeInner<T, LenT, OwnedStorage<N>>;
 
 /// A double-ended queue with dynamic capacity.
 ///
@@ -104,7 +106,7 @@ pub type Deque<T, const N: usize> = DequeInner<T, OwnedStorage<N>>;
 /// let mut deque_buf = Deque::<_, 8>::new();
 ///
 /// // A DequeView can be obtained through unsized coercion of a `Deque`
-/// let deque: &mut DequeView<_> = &mut deque_buf;
+/// let deque: &mut DequeView<_, _> = &mut deque_buf;
 ///
 /// // You can use it as a good old FIFO queue.
 /// deque.push_back(1);
@@ -130,9 +132,9 @@ pub type Deque<T, const N: usize> = DequeInner<T, OwnedStorage<N>>;
 ///     println!("{}", x);
 /// }
 /// ```
-pub type DequeView<T> = DequeInner<T, ViewStorage>;
+pub type DequeView<T, LenT = usize> = DequeInner<T, LenT, ViewStorage>;
 
-impl<T, const N: usize> Deque<T, N> {
+impl<T, LenT: LenType, const N: usize> Deque<T, N, LenT> {
     const INIT: MaybeUninit<T> = MaybeUninit::uninit();
 
     /// Constructs a new, empty deque with a fixed capacity of `N`
@@ -154,8 +156,8 @@ impl<T, const N: usize> Deque<T, N> {
 
         Self {
             buffer: [Self::INIT; N],
-            front: 0,
-            back: 0,
+            front: LenT::ZERO,
+            back: LenT::ZERO,
             full: false,
         }
     }
@@ -170,66 +172,75 @@ impl<T, const N: usize> Deque<T, N> {
     /// Returns the number of elements currently in the deque.
     ///
     /// This method is not available on a `DequeView`, use [`storage_len`](DequeInner::storage_len) instead
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.full {
             N
         } else if self.back < self.front {
-            self.back + N - self.front
+            self.back.into_usize() + N - self.front.into_usize()
         } else {
-            self.back - self.front
+            self.back.into_usize() - self.front.into_usize()
         }
     }
 
     /// Get a reference to the `Deque`, erasing the `N` const-generic.
-    pub fn as_view(&self) -> &DequeView<T> {
+    pub fn as_view(&self) -> &DequeView<T, LenT> {
         self
     }
 
     /// Get a mutable reference to the `Deque`, erasing the `N` const-generic.
-    pub fn as_mut_view(&mut self) -> &mut DequeView<T> {
+    pub fn as_mut_view(&mut self) -> &mut DequeView<T, LenT> {
         self
     }
 }
 
-impl<T, S: Storage> DequeInner<T, S> {
+impl<T, LenT: LenType, S: Storage> DequeInner<T, LenT, S> {
     /// Returns the maximum number of elements the deque can hold.
     pub fn storage_capacity(&self) -> usize {
         self.buffer.borrow().len()
     }
 
-    fn increment(&self, i: usize) -> usize {
-        if i + 1 == self.storage_capacity() {
-            0
+    fn storage_capacity_as_lentype(&self) -> LenT {
+        LenT::from_usize(self.storage_capacity())
+    }
+
+    fn increment(&self, i: LenT) -> LenT {
+        if i + LenT::ONE == self.storage_capacity_as_lentype() {
+            LenT::ZERO
         } else {
-            i + 1
+            i + LenT::ONE
         }
     }
 
-    fn decrement(&self, i: usize) -> usize {
-        if i == 0 {
-            self.storage_capacity() - 1
+    fn decrement(&self, i: LenT) -> LenT {
+        if i == LenT::ZERO {
+            self.storage_capacity_as_lentype() - LenT::ONE
         } else {
-            i - 1
+            i - LenT::ONE
+        }
+    }
+
+    fn storage_len_as_lentype(&self) -> LenT {
+        let storage_cap = self.storage_capacity_as_lentype();
+        if self.full {
+            storage_cap
+        } else if self.back < self.front {
+            self.back + storage_cap - self.front
+        } else {
+            self.back - self.front
         }
     }
 
     /// Returns the number of elements currently in the deque.
     pub fn storage_len(&self) -> usize {
-        if self.full {
-            self.storage_capacity()
-        } else if self.back < self.front {
-            self.back + self.storage_capacity() - self.front
-        } else {
-            self.back - self.front
-        }
+        self.storage_len_as_lentype().into_usize()
     }
 
     /// Clears the deque, removing all values.
     pub fn clear(&mut self) {
         // safety: we're immediately setting a consistent empty state.
         unsafe { self.drop_contents() }
-        self.front = 0;
-        self.back = 0;
+        self.front = LenT::ZERO;
+        self.back = LenT::ZERO;
         self.full = false;
     }
 
@@ -262,16 +273,19 @@ impl<T, S: Storage> DequeInner<T, S> {
             } else if self.back <= self.front {
                 (
                     slice::from_raw_parts(
-                        self.buffer.borrow().as_ptr().add(self.front) as *const T,
-                        self.storage_capacity() - self.front,
+                        self.buffer.borrow().as_ptr().add(self.front.into_usize()) as *const T,
+                        self.storage_capacity() - self.front.into_usize(),
                     ),
-                    slice::from_raw_parts(self.buffer.borrow().as_ptr() as *const T, self.back),
+                    slice::from_raw_parts(
+                        self.buffer.borrow().as_ptr() as *const T,
+                        self.back.into_usize(),
+                    ),
                 )
             } else {
                 (
                     slice::from_raw_parts(
-                        self.buffer.borrow().as_ptr().add(self.front) as *const T,
-                        self.back - self.front,
+                        self.buffer.borrow().as_ptr().add(self.front.into_usize()) as *const T,
+                        (self.back - self.front).into_usize(),
                     ),
                     &[],
                 )
@@ -290,16 +304,16 @@ impl<T, S: Storage> DequeInner<T, S> {
             } else if self.back <= self.front {
                 (
                     slice::from_raw_parts_mut(
-                        ptr.add(self.front) as *mut T,
-                        self.storage_capacity() - self.front,
+                        ptr.add(self.front.into_usize()) as *mut T,
+                        (self.storage_capacity_as_lentype() - self.front).into_usize(),
                     ),
-                    slice::from_raw_parts_mut(ptr as *mut T, self.back),
+                    slice::from_raw_parts_mut(ptr as *mut T, self.back.into_usize()),
                 )
             } else {
                 (
                     slice::from_raw_parts_mut(
-                        ptr.add(self.front) as *mut T,
-                        self.back - self.front,
+                        ptr.add(self.front.into_usize()) as *mut T,
+                        (self.back - self.front).into_usize(),
                     ),
                     &mut [],
                 )
@@ -309,7 +323,7 @@ impl<T, S: Storage> DequeInner<T, S> {
 
     #[inline]
     fn is_contiguous(&self) -> bool {
-        self.front <= self.storage_capacity() - self.storage_len()
+        self.front <= self.storage_capacity_as_lentype() - self.storage_len_as_lentype()
     }
 
     /// Rearranges the internal storage of the [`Deque`] to make it into a contiguous slice,
@@ -346,7 +360,11 @@ impl<T, S: Storage> DequeInner<T, S> {
         if self.is_contiguous() {
             return unsafe {
                 slice::from_raw_parts_mut(
-                    self.buffer.borrow_mut().as_mut_ptr().add(self.front).cast(),
+                    self.buffer
+                        .borrow_mut()
+                        .as_mut_ptr()
+                        .add(self.front.into_usize())
+                        .cast(),
                     self.storage_len(),
                 )
             };
@@ -357,7 +375,7 @@ impl<T, S: Storage> DequeInner<T, S> {
         let len = self.storage_len();
 
         let free = self.storage_capacity() - len;
-        let front_len = self.storage_capacity() - self.front;
+        let front_len = self.storage_capacity() - self.front.into_usize();
         let back = len - front_len;
         let back_len = back;
 
@@ -371,12 +389,16 @@ impl<T, S: Storage> DequeInner<T, S> {
             unsafe {
                 ptr::copy(buffer_ptr, buffer_ptr.add(front_len), back_len);
                 // ...DEFGH.ABC
-                ptr::copy_nonoverlapping(buffer_ptr.add(self.front), buffer_ptr, front_len);
+                ptr::copy_nonoverlapping(
+                    buffer_ptr.add(self.front.into_usize()),
+                    buffer_ptr,
+                    front_len,
+                );
                 // ABCDEFGH....
             }
 
-            self.front = 0;
-            self.back = len;
+            self.front = LenT::ZERO;
+            self.back = LenT::from_usize(len);
         } else if free >= back_len {
             // there is enough free space to copy the tail in one go,
             // this means that we first shift the head forwards, and then
@@ -386,21 +408,21 @@ impl<T, S: Storage> DequeInner<T, S> {
             // to:   ...ABCDEFGH.
             unsafe {
                 ptr::copy(
-                    buffer_ptr.add(self.front),
-                    buffer_ptr.add(self.back),
+                    buffer_ptr.add(self.front.into_usize()),
+                    buffer_ptr.add(self.back.into_usize()),
                     front_len,
                 );
                 // FGHABCDE....
                 ptr::copy_nonoverlapping(
                     buffer_ptr,
-                    buffer_ptr.add(self.back + front_len),
+                    buffer_ptr.add(self.back.into_usize() + front_len),
                     back_len,
                 );
                 // ...ABCDEFGH.
             }
 
-            self.front = back;
-            self.back = 0;
+            self.front = LenT::from_usize(back);
+            self.back = LenT::ZERO;
         } else {
             // `free` is smaller than both `head_len` and `tail_len`.
             // the general algorithm for this first moves the slices
@@ -447,8 +469,8 @@ impl<T, S: Storage> DequeInner<T, S> {
 
                     // the used part of the buffer now is `free..self.capacity()`, so set
                     // `head` to the beginning of that range.
-                    self.front = free;
-                    self.back = 0;
+                    self.front = LenT::from_usize(free);
+                    self.back = LenT::ZERO;
                 }
             } else {
                 // head is shorter so:
@@ -462,7 +484,7 @@ impl<T, S: Storage> DequeInner<T, S> {
                     if free != 0 {
                         // copy the head slice to lie right behind the tail slice.
                         ptr::copy(
-                            buffer_ptr.add(self.front),
+                            buffer_ptr.add(self.front.into_usize()),
                             buffer_ptr.add(back_len),
                             front_len,
                         );
@@ -478,13 +500,13 @@ impl<T, S: Storage> DequeInner<T, S> {
 
                     // the used part of the buffer now is `0..self.len`, so set
                     // `head` to the beginning of that range.
-                    self.front = 0;
-                    self.back = len;
+                    self.front = LenT::ZERO;
+                    self.back = LenT::from_usize(len);
                 }
             }
         }
 
-        unsafe { slice::from_raw_parts_mut(buffer_ptr.add(self.front), len) }
+        unsafe { slice::from_raw_parts_mut(buffer_ptr.add(self.front.into_usize()), len) }
     }
 
     /// Provides a reference to the front element, or None if the `Deque` is empty.
@@ -492,7 +514,8 @@ impl<T, S: Storage> DequeInner<T, S> {
         if self.is_empty() {
             None
         } else {
-            Some(unsafe { &*self.buffer.borrow().get_unchecked(self.front).as_ptr() })
+            let front = self.front.into_usize();
+            Some(unsafe { &*self.buffer.borrow().get_unchecked(front).as_ptr() })
         }
     }
 
@@ -505,7 +528,7 @@ impl<T, S: Storage> DequeInner<T, S> {
                 &mut *self
                     .buffer
                     .borrow_mut()
-                    .get_unchecked_mut(self.front)
+                    .get_unchecked_mut(self.front.into_usize())
                     .as_mut_ptr()
             })
         }
@@ -516,7 +539,7 @@ impl<T, S: Storage> DequeInner<T, S> {
         if self.is_empty() {
             None
         } else {
-            let index = self.decrement(self.back);
+            let index = self.decrement(self.back).into_usize();
             Some(unsafe { &*self.buffer.borrow().get_unchecked(index).as_ptr() })
         }
     }
@@ -526,7 +549,7 @@ impl<T, S: Storage> DequeInner<T, S> {
         if self.is_empty() {
             None
         } else {
-            let index = self.decrement(self.back);
+            let index = self.decrement(self.back).into_usize();
             Some(unsafe {
                 &mut *self
                     .buffer
@@ -588,7 +611,7 @@ impl<T, S: Storage> DequeInner<T, S> {
     pub unsafe fn pop_front_unchecked(&mut self) -> T {
         debug_assert!(!self.is_empty());
 
-        let index = self.front;
+        let index = self.front.into_usize();
         self.full = false;
         self.front = self.increment(self.front);
         self.buffer
@@ -611,7 +634,7 @@ impl<T, S: Storage> DequeInner<T, S> {
         self.back = self.decrement(self.back);
         self.buffer
             .borrow_mut()
-            .get_unchecked_mut(self.back)
+            .get_unchecked_mut(self.back.into_usize())
             .as_ptr()
             .read()
     }
@@ -627,7 +650,10 @@ impl<T, S: Storage> DequeInner<T, S> {
         let index = self.decrement(self.front);
         // NOTE: the memory slot that we are about to write to is uninitialized. We assign
         // a `MaybeUninit` to avoid running `T`'s destructor on the uninitialized memory
-        *self.buffer.borrow_mut().get_unchecked_mut(index) = MaybeUninit::new(item);
+        *self
+            .buffer
+            .borrow_mut()
+            .get_unchecked_mut(index.into_usize()) = MaybeUninit::new(item);
         self.front = index;
         if self.front == self.back {
             self.full = true;
@@ -644,7 +670,10 @@ impl<T, S: Storage> DequeInner<T, S> {
 
         // NOTE: the memory slot that we are about to write to is uninitialized. We assign
         // a `MaybeUninit` to avoid running `T`'s destructor on the uninitialized memory
-        *self.buffer.borrow_mut().get_unchecked_mut(self.back) = MaybeUninit::new(item);
+        *self
+            .buffer
+            .borrow_mut()
+            .get_unchecked_mut(self.back.into_usize()) = MaybeUninit::new(item);
         self.back = self.increment(self.back);
         if self.front == self.back {
             self.full = true;
@@ -707,7 +736,7 @@ impl<T, S: Storage> DequeInner<T, S> {
     }
 
     fn to_physical_index(&self, index: usize) -> usize {
-        let mut res = self.front + index;
+        let mut res = self.front.into_usize() + index;
         if res >= self.storage_capacity() {
             res -= self.storage_capacity();
         }
@@ -788,13 +817,13 @@ impl<'a, T> FusedIterator for IterMut<'a, T> {}
 
 // Trait implementations
 
-impl<T, const N: usize> Default for Deque<T, N> {
+impl<T, LenT: LenType, const N: usize> Default for Deque<T, N, LenT> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, S: Storage> Drop for DequeInner<T, S> {
+impl<T, LenT: LenType, S: Storage> Drop for DequeInner<T, LenT, S> {
     fn drop(&mut self) {
         // safety: `self` is left in an inconsistent state but it doesn't matter since
         // it's getting dropped. Nothing should be able to observe `self` after drop.
@@ -802,21 +831,21 @@ impl<T, S: Storage> Drop for DequeInner<T, S> {
     }
 }
 
-impl<T: fmt::Debug, S: Storage> fmt::Debug for DequeInner<T, S> {
+impl<T: fmt::Debug, LenT: LenType, S: Storage> fmt::Debug for DequeInner<T, LenT, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self).finish()
     }
 }
 
 /// As with the standard library's `VecDeque`, items are added via `push_back`.
-impl<T, S: Storage> Extend<T> for DequeInner<T, S> {
+impl<T, LenT: LenType, S: Storage> Extend<T> for DequeInner<T, LenT, S> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for item in iter {
             self.push_back(item).ok().unwrap();
         }
     }
 }
-impl<'a, T: 'a + Copy, S: Storage> Extend<&'a T> for DequeInner<T, S> {
+impl<'a, T: 'a + Copy, LenT: LenType, S: Storage> Extend<&'a T> for DequeInner<T, LenT, S> {
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.extend(iter.into_iter().copied())
     }
@@ -826,27 +855,27 @@ impl<'a, T: 'a + Copy, S: Storage> Extend<&'a T> for DequeInner<T, S> {
 ///
 /// This struct is created by calling the `into_iter` method.
 #[derive(Clone)]
-pub struct IntoIter<T, const N: usize> {
-    deque: Deque<T, N>,
+pub struct IntoIter<T, LenT: LenType, const N: usize> {
+    deque: Deque<T, N, LenT>,
 }
 
-impl<T, const N: usize> Iterator for IntoIter<T, N> {
+impl<T, LenT: LenType, const N: usize> Iterator for IntoIter<T, LenT, N> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         self.deque.pop_front()
     }
 }
 
-impl<T, const N: usize> IntoIterator for Deque<T, N> {
+impl<T, LenT: LenType, const N: usize> IntoIterator for Deque<T, N, LenT> {
     type Item = T;
-    type IntoIter = IntoIter<T, N>;
+    type IntoIter = IntoIter<T, LenT, N>;
 
     fn into_iter(self) -> Self::IntoIter {
         IntoIter { deque: self }
     }
 }
 
-impl<'a, T, S: Storage> IntoIterator for &'a DequeInner<T, S> {
+impl<'a, T, LenT: LenType, S: Storage> IntoIterator for &'a DequeInner<T, LenT, S> {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
 
@@ -855,7 +884,7 @@ impl<'a, T, S: Storage> IntoIterator for &'a DequeInner<T, S> {
     }
 }
 
-impl<'a, T, S: Storage> IntoIterator for &'a mut DequeInner<T, S> {
+impl<'a, T, LenT: LenType, S: Storage> IntoIterator for &'a mut DequeInner<T, LenT, S> {
     type Item = &'a mut T;
     type IntoIter = IterMut<'a, T>;
 
@@ -864,7 +893,7 @@ impl<'a, T, S: Storage> IntoIterator for &'a mut DequeInner<T, S> {
     }
 }
 
-impl<T, const N: usize> Clone for Deque<T, N>
+impl<T, LenT: LenType, const N: usize> Clone for Deque<T, N, LenT>
 where
     T: Clone,
 {

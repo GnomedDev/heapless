@@ -135,7 +135,7 @@ where
     }
 }
 
-impl<'de, T, const N: usize> Deserialize<'de> for Deque<T, N>
+impl<'de, T, LenT: LenType, const N: usize> Deserialize<'de> for Deque<T, N, LenT>
 where
     T: Deserialize<'de>,
 {
@@ -143,13 +143,14 @@ where
     where
         D: Deserializer<'de>,
     {
-        struct ValueVisitor<'de, T, const N: usize>(PhantomData<(&'de (), T)>);
+        struct ValueVisitor<'de, T, LenT: LenType, const N: usize>(PhantomData<(&'de (), LenT, T)>);
 
-        impl<'de, T, const N: usize> serde::de::Visitor<'de> for ValueVisitor<'de, T, N>
+        impl<'de, T, LenT: LenType, const N: usize> serde::de::Visitor<'de>
+            for ValueVisitor<'de, T, LenT, N>
         where
             T: Deserialize<'de>,
         {
-            type Value = Deque<T, N>;
+            type Value = Deque<T, N, LenT>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a sequence")
